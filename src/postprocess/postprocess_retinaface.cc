@@ -3,6 +3,7 @@
 // Class 0=background, 1=face
 
 #include "postprocess_common.h"
+#include "rknn_box_priors.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,35 +76,39 @@ int postprocess_retinaface(struct _RknnProcess* rknn_process,
     if (!rknn_process || rknn_process->io_num.n_output < 2) return -1;
     memset(group, 0, sizeof(detect_result_group_t));
 
-    int num_anchors = rknn_process->output_attrs[0].n_elems / 4;
-    if (num_anchors > 10000) num_anchors = 4200;
-    int32_t box_zp = qnt_zps.size() > 0 ? qnt_zps[0] : 0;
-    float box_scale = qnt_scales.size() > 0 ? qnt_scales[0] : 1.0f;
-    int32_t score_zp = qnt_zps.size() > 1 ? qnt_zps[1] : 0;
-    float score_scale = qnt_scales.size() > 1 ? qnt_scales[1] : 1.0f;
+    int num_anchors = 4200;
+    const float (*prior_ptr)[4] = BOX_PRIORS_320;
 
-    int8_t* box_ptr = (int8_t*)rknn_process->outputs[0].buf;
-    int8_t* score_ptr = (int8_t*)rknn_process->outputs[1].buf;
+    float* box_ptr = (float*)rknn_process->outputs[0].buf;
+    float* score_ptr = (float*)rknn_process->outputs[1].buf;
 
     std::vector<float> filterBoxes;
     std::vector<float> objProbs;
     std::vector<int> classId;
 
+    const float VARIANCES[2] = {0.1f, 0.2f};
+    float model_w = (float)rknn_process->model_width;
+    float model_h = (float)rknn_process->model_height;
+
     for (int idx = 0; idx < num_anchors; idx++) {
-        float conf = deqnt_affine_to_f32(score_ptr[idx * 2 + 1], score_zp, score_scale);
+        float conf = score_ptr[idx * 2 + 1];
         if (conf < box_conf_threshold) continue;
 
-        float x = deqnt_affine_to_f32(box_ptr[idx], box_zp, box_scale);
-        float y = deqnt_affine_to_f32(box_ptr[idx + num_anchors], box_zp, box_scale);
-        float w = deqnt_affine_to_f32(box_ptr[idx + num_anchors * 2], box_zp, box_scale);
-        float h = deqnt_affine_to_f32(box_ptr[idx + num_anchors * 3], box_zp, box_scale);
+        float* prior = (float*)prior_ptr[idx];
+        float xcenter = box_ptr[idx * 4 + 0] * VARIANCES[0] * prior[2] + prior[0];
+        float ycenter = box_ptr[idx * 4 + 1] * VARIANCES[0] * prior[3] + prior[1];
+        float w = (float)expf(box_ptr[idx * 4 + 2] * VARIANCES[1]) * prior[2];
+        float h = (float)expf(box_ptr[idx * 4 + 3] * VARIANCES[1]) * prior[3];
 
-        float x1 = x - w / 2;
-        float y1 = y - h / 2;
-        filterBoxes.push_back(x1);
-        filterBoxes.push_back(y1);
-        filterBoxes.push_back(w);
-        filterBoxes.push_back(h);
+        float x1 = xcenter - w * 0.5f;
+        float y1 = ycenter - h * 0.5f;
+        float bw = w;
+        float bh = h;
+
+        filterBoxes.push_back(x1 * model_w);
+        filterBoxes.push_back(y1 * model_h);
+        filterBoxes.push_back(bw * model_w);
+        filterBoxes.push_back(bh * model_h);
         objProbs.push_back(conf);
         classId.push_back(0);
     }
@@ -118,8 +123,10 @@ int postprocess_retinaface(struct _RknnProcess* rknn_process,
 
     int last = 0;
     float sw = rknn_process->scale_w, sh = rknn_process->scale_h;
+    float scale = sw < sh ? sw : sh;
     BOX_RECT pads = rknn_process->pads;
-    int mh = rknn_process->model_height, mw = rknn_process->model_width;
+    int original_width = rknn_process->original_width;
+    int original_height = rknn_process->original_height;
 
     for (int i = 0; i < validCount && last < OBJ_NUMB_MAX_SIZE; i++) {
         if (indexArray[i] == -1) continue;
@@ -127,13 +134,21 @@ int postprocess_retinaface(struct _RknnProcess* rknn_process,
         float x1 = filterBoxes[n * 4 + 0] - pads.left;
         float y1 = filterBoxes[n * 4 + 1] - pads.top;
         float bw = filterBoxes[n * 4 + 2], bh = filterBoxes[n * 4 + 3];
-        group->results[last].box.left = (int)(clamp(x1, 0, mw) / sw);
-        group->results[last].box.top = (int)(clamp(y1, 0, mh) / sh);
-        group->results[last].box.right = (int)(clamp(x1 + bw, 0, mw) / sw);
-        group->results[last].box.bottom = (int)(clamp(y1 + bh, 0, mh) / sh);
+
+        float left = x1 / scale;
+        float top = y1 / scale;
+        float right = (x1 + bw) / scale;
+        float bottom = (y1 + bh) / scale;
+
+        group->results[last].box.left = (int)clampf(left, 0.f, (float)original_width);
+        group->results[last].box.top = (int)clampf(top, 0.f, (float)original_height);
+        group->results[last].box.right = (int)clampf(right, 0.f, (float)original_width);
+        group->results[last].box.bottom = (int)clampf(bottom, 0.f, (float)original_height);
+
         group->results[last].prop = objProbs[i];
         strncpy(group->results[last].name, "face", OBJ_NAME_MAX_SIZE - 1);
         group->results[last].name[OBJ_NAME_MAX_SIZE - 1] = '\0';
+
         last++;
     }
     group->count = last;
