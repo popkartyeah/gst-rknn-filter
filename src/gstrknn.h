@@ -59,7 +59,7 @@
 #include "rknn_api.h"
 #include "rknnprocess.h"
 #define MAX_QUEUE_LENGTH 4
-#define MAX_DMABUF_INSTANCES 5
+#define MAX_DMABUF_INSTANCES 10
 #define ALIGN_UP(x, align) (((x) + ((align)-1)) & ~((align)-1))
 
 #define PLUGIN_RKNN_SUPPORT_FORMATS MPP_SUPPORT_FORMATS "," RGA_SUPPORT_FORMATS
