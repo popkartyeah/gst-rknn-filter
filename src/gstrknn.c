@@ -65,6 +65,7 @@
 #include "gst/video/video-format.h"
 #include "gst/video/video-info.h"
 #include "rknnprocess.h"
+#include "gst_face_meta.h"
 #include <unistd.h>
 #ifdef HAVE_CONFIG_H
 #include <config.h>
@@ -607,14 +608,16 @@ gboolean prepare_dmabuf_memory(GstPluginRknn* filter, int index, gsize mem_size,
     if (index < 0 || index >= MAX_DMABUF_INSTANCES)
         return FALSE;
 
-    // 如果已分配且大小一致，直接复用
-    if (filter->cached_dmabuf_fd[index] >= 0 && filter->cached_dmabuf_size[index] == mem_size && filter->cached_dmabuf_mem[index]) {
+    // 如果已分配且大小一致，检查是否可写
+    if (filter->cached_dmabuf_fd[index] >= 0 && filter->cached_dmabuf_size[index] == mem_size && 
+        filter->cached_dmabuf_mem[index] && filter->cached_dmabuf_ptr[index]) {
         *mem = filter->cached_dmabuf_mem[index];
-        if (!gst_memory_is_writable(*mem)) {
-            GST_ERROR_OBJECT(filter, "DMABUF memory fd %d is not writable",
+        if (gst_memory_is_writable(*mem)) {
+            return TRUE;
+        } else {
+            GST_WARNING_OBJECT(filter, "DMABUF memory fd %d is not writable, will reallocate",
                 filter->cached_dmabuf_fd[index]);
         }
-        return TRUE;
     }
 
     // 释放旧的
@@ -694,8 +697,7 @@ static gpointer rknn_task_func(gpointer data)
             continue;
         }
 
-        if (filter->silent == FALSE)
-            g_print("I'm plugged, therefore I'm in.\n");
+
 
         if (filter->bypass) {
             if (!task_data->stop) {
@@ -816,27 +818,28 @@ static gpointer rknn_task_func(gpointer data)
             continue;
         }
 
+        // Calculate scaling parameters for coordinate transformation (always calculate)
+        float scale_w = (float)filter->rknn_process.model_width / filter->sink_width;
+        float scale_h = (float)filter->rknn_process.model_height / filter->sink_height;
+        float scale = scale_w < scale_h ? scale_w : scale_h;
+        int new_w = (int)(filter->sink_width * scale + 0.5f);
+        int new_h = (int)(filter->sink_height * scale + 0.5f);
+        int offset_x = (filter->rknn_process.model_width - new_w) / 2;
+        int offset_y = (filter->rknn_process.model_height - new_h) / 2;
+        filter->rknn_process.pads.left = offset_x;
+        filter->rknn_process.pads.right = offset_x + new_w;
+        filter->rknn_process.pads.top = offset_y;
+        filter->rknn_process.pads.bottom = offset_y + new_h;
+        filter->rknn_process.scale_w = scale;
+        filter->rknn_process.scale_h = scale;
+        filter->rknn_process.original_width = filter->sink_width;
+        filter->rknn_process.original_height = filter->sink_height;
+
         if (filter->need_inference) {
             // rga letterboxing
             rga_buffer_t rga_buf_rknn_input = wrapbuffer_fd_t(gst_dmabuf_memory_get_fd(mem_rknn_in), filter->rknn_process.model_width, filter->rknn_process.model_height, filter->rknn_process.model_width, filter->rknn_process.model_height, RK_FORMAT_RGB_888);
             // Define letterboxing rectangles
-            // Calculate scaling ratio to maintain aspect ratio
-            float scale_w = (float)filter->rknn_process.model_width / filter->sink_width;
-            float scale_h = (float)filter->rknn_process.model_height / filter->sink_height;
-            float scale = scale_w < scale_h ? scale_w : scale_h;
-            int new_w = (int)(filter->sink_width * scale + 0.5f);
-            int new_h = (int)(filter->sink_height * scale + 0.5f);
-            int offset_x = (filter->rknn_process.model_width - new_w) / 2;
-            int offset_y = (filter->rknn_process.model_height - new_h) / 2;
             im_rect rect_rknn_input = { offset_x, offset_y, new_w, new_h };
-            filter->rknn_process.pads.left = offset_x;
-            filter->rknn_process.pads.right = offset_x + new_w;
-            filter->rknn_process.pads.top = offset_y;
-            filter->rknn_process.pads.bottom = offset_y + new_h;
-            filter->rknn_process.scale_w = scale;
-            filter->rknn_process.scale_h = scale;
-            filter->rknn_process.original_width = filter->sink_width;
-            filter->rknn_process.original_height = filter->sink_height;
             GST_DEBUG_OBJECT(filter, "RGA letterboxing: src_rect=(%d,%d,%d,%d), dst_rect=(%d,%d,%d,%d)",
                 rect_in_dmabuf.x, rect_in_dmabuf.y, rect_in_dmabuf.width, rect_in_dmabuf.height,
                 rect_rknn_input.x, rect_rknn_input.y, rect_rknn_input.width, rect_rknn_input.height);
@@ -866,11 +869,9 @@ static gpointer rknn_task_func(gpointer data)
 
         dmabuf_sync_start(gst_dmabuf_memory_get_fd(mem_in_rgb));
         if (filter->need_inference) {
-            // 执行推理
-            rknn_inference_and_postprocess(&filter->rknn_process, filter->cached_dmabuf_ptr[2 + filter->src_buffer_index], 0.6, 0.45, filter->show_fps ? 1 : 0, filter->current_fps, 1);
+            rknn_inference_and_postprocess(&filter->rknn_process, filter->cached_dmabuf_ptr[2 + filter->src_buffer_index], 0.5, 0.4, filter->show_fps ? 1 : 0, filter->current_fps, 1, current_time);
         } else {
-            // 不推理时，直接将上一帧的结果绘制到当前帧
-            rknn_inference_and_postprocess(&filter->rknn_process, filter->cached_dmabuf_ptr[2 + filter->src_buffer_index], 0.6, 0.45, filter->show_fps ? 1 : 0, filter->current_fps, 0);
+            rknn_inference_and_postprocess(&filter->rknn_process, filter->cached_dmabuf_ptr[2 + filter->src_buffer_index], 0.5, 0.4, filter->show_fps ? 1 : 0, filter->current_fps, 0, current_time);
         }
         dmabuf_sync_stop(gst_dmabuf_memory_get_fd(mem_in_rgb));
         // check refcount of out gst memory
@@ -886,6 +887,22 @@ static gpointer rknn_task_func(gpointer data)
         GST_BUFFER_PTS(filter->src_buffer) = GST_BUFFER_PTS(buf);
         GST_BUFFER_DTS(filter->src_buffer) = GST_BUFFER_DTS(buf);
         GST_BUFFER_DURATION(filter->src_buffer) = GST_BUFFER_DURATION(buf);
+
+        g_print("[RKNN] last_detect_result.count = %d\n", filter->rknn_process.last_detect_result.count);
+        if (filter->rknn_process.last_detect_result.count > 0) {
+            g_print("[RKNN] Adding face meta with %d faces\n", filter->rknn_process.last_detect_result.count);
+            gst_face_meta_add(filter->src_buffer, 
+                             filter->rknn_process.last_detect_result.count,
+                             filter->rknn_process.last_detect_result.results);
+            g_print("[RKNN] Face meta added successfully\n");
+            // Verify meta was added
+            GstFaceMeta* check_meta = gst_face_meta_get(filter->src_buffer);
+            if (check_meta) {
+                g_print("[RKNN] Verified: Face meta retrieved with %d faces\n", check_meta->face_count);
+            } else {
+                g_print("[RKNN] ERROR: Face meta not found after adding!\n");
+            }
+        }
 
         // Ensure RGB caps are set before pushing buffer
         // gst_plugin_rknn_ensure_rgb_caps(filter);
