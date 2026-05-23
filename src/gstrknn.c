@@ -608,16 +608,11 @@ gboolean prepare_dmabuf_memory(GstPluginRknn* filter, int index, gsize mem_size,
     if (index < 0 || index >= MAX_DMABUF_INSTANCES)
         return FALSE;
 
-    // 如果已分配且大小一致，检查是否可写
+    // 如果已分配且大小一致，直接使用（不管是否可写，因为我们轮换使用多个缓冲区）
     if (filter->cached_dmabuf_fd[index] >= 0 && filter->cached_dmabuf_size[index] == mem_size && 
         filter->cached_dmabuf_mem[index] && filter->cached_dmabuf_ptr[index]) {
         *mem = filter->cached_dmabuf_mem[index];
-        if (gst_memory_is_writable(*mem)) {
-            return TRUE;
-        } else {
-            GST_WARNING_OBJECT(filter, "DMABUF memory fd %d is not writable, will reallocate",
-                filter->cached_dmabuf_fd[index]);
-        }
+        return TRUE;
     }
 
     // 释放旧的
@@ -874,29 +869,27 @@ static gpointer rknn_task_func(gpointer data)
             rknn_inference_and_postprocess(&filter->rknn_process, filter->cached_dmabuf_ptr[2 + filter->src_buffer_index], 0.5, 0.4, filter->show_fps ? 1 : 0, filter->current_fps, 0, current_time);
         }
         dmabuf_sync_stop(gst_dmabuf_memory_get_fd(mem_in_rgb));
-        // check refcount of out gst memory
-
-        if (!filter->src_buffer) {
-            filter->src_buffer = gst_buffer_new(); // src_buffer refcount=1
-        }
-        if (gst_buffer_n_memory(filter->src_buffer) == 0) {
-            GstMemory* mem_in_rgb_ref = gst_memory_ref(mem_in_rgb); // mem_in_rgb refcount=2
-            gst_buffer_append_memory(filter->src_buffer, mem_in_rgb_ref); // mem_in_rgb refcount=2, mem_in_rgb_ref refcount=1, src_buffer refcount=1
-        }
+        // Create a new buffer for output
+        GstBuffer* output_buffer = gst_buffer_new();
+        
+        // Add the RGB memory to the output buffer
+        GstMemory* mem_in_rgb_ref = gst_memory_ref(mem_in_rgb);
+        gst_buffer_append_memory(output_buffer, mem_in_rgb_ref);
+        
         // 继承时间戳和元数据
-        GST_BUFFER_PTS(filter->src_buffer) = GST_BUFFER_PTS(buf);
-        GST_BUFFER_DTS(filter->src_buffer) = GST_BUFFER_DTS(buf);
-        GST_BUFFER_DURATION(filter->src_buffer) = GST_BUFFER_DURATION(buf);
+        GST_BUFFER_PTS(output_buffer) = GST_BUFFER_PTS(buf);
+        GST_BUFFER_DTS(output_buffer) = GST_BUFFER_DTS(buf);
+        GST_BUFFER_DURATION(output_buffer) = GST_BUFFER_DURATION(buf);
 
         g_print("[RKNN] last_detect_result.count = %d\n", filter->rknn_process.last_detect_result.count);
         if (filter->rknn_process.last_detect_result.count > 0) {
             g_print("[RKNN] Adding face meta with %d faces\n", filter->rknn_process.last_detect_result.count);
-            gst_face_meta_add(filter->src_buffer, 
+            gst_face_meta_add(output_buffer, 
                              filter->rknn_process.last_detect_result.count,
                              filter->rknn_process.last_detect_result.results);
             g_print("[RKNN] Face meta added successfully\n");
             // Verify meta was added
-            GstFaceMeta* check_meta = gst_face_meta_get(filter->src_buffer);
+            GstFaceMeta* check_meta = gst_face_meta_get(output_buffer);
             if (check_meta) {
                 g_print("[RKNN] Verified: Face meta retrieved with %d faces\n", check_meta->face_count);
             } else {
@@ -908,11 +901,10 @@ static gpointer rknn_task_func(gpointer data)
         // gst_plugin_rknn_ensure_rgb_caps(filter);
 
         if (!task_data->stop) {
-            gst_pad_push(filter->srcpad, filter->src_buffer);
+            gst_pad_push(filter->srcpad, output_buffer);
         } else {
-            gst_buffer_unref(filter->src_buffer);
+            gst_buffer_unref(output_buffer);
         }
-        filter->src_buffer = NULL;
 
         gst_buffer_unref(buf);
         // print time consumed
