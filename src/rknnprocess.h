@@ -25,13 +25,31 @@ typedef enum {
     RKNN_MODEL_MAX
 } RknnModelType;
 
-typedef struct _BOX_RECT
+typedef struct __BOX_RECT
 {
     int left;
     int right;
     int top;
     int bottom;
 } BOX_RECT;
+
+#define OBJ_NAME_MAX_SIZE 16
+#define OBJ_NUMB_MAX_SIZE 128
+
+typedef struct __detect_result_t
+{
+    char name[OBJ_NAME_MAX_SIZE];
+    BOX_RECT box;
+    float prop;
+} detect_result_t;
+
+typedef struct _detect_result_group_t
+{
+    int id;
+    int count;
+    detect_result_t results[OBJ_NUMB_MAX_SIZE];
+} detect_result_group_t;
+
 struct _RknnProcess {
     rknn_context ctx;
     rknn_input* inputs;
@@ -51,6 +69,7 @@ struct _RknnProcess {
     char* label_path;
     char* model_path;
     RknnModelType model_type;
+    detect_result_group_t last_detect_result;
 };
 
 #ifdef __cplusplus
@@ -65,7 +84,8 @@ int rknn_inference_and_postprocess(
     float nms_threshold,
     int show_fps,      
     double current_fps,
-    int do_inference   // 新增参数：是否执行推理，0=不推理，1=推理
+    int do_inference,   // 是否执行推理，0=不推理，1=推理
+    int64_t unused      // 未使用的参数，为了与调用代码兼容
 );
 void rknn_release(struct _RknnProcess* rknn_process);
 #ifdef __cplusplus

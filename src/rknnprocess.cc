@@ -117,7 +117,8 @@ int rknn_inference_and_postprocess(
     float nms_threshold,
     int show_fps,      
     double current_fps,
-    int do_inference
+    int do_inference,
+    int64_t unused
 )
 {
     int ret = 0;
@@ -132,6 +133,9 @@ int rknn_inference_and_postprocess(
 
     if (ret != 0)
         return ret;
+
+    // 保存检测结果
+    memcpy(&rknn_process->last_detect_result, &detect_result_group, sizeof(detect_result_group_t));
 
     // 画框和概率
     char text[256];
@@ -152,8 +156,6 @@ int rknn_inference_and_postprocess(
     }
     // imwrite("inference.bmp", orig_img_cv);
 
-    // 释放推理结果
-    
     return ret;
 }
 void rknn_release(struct _RknnProcess* rknn_process)
