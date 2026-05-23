@@ -104,8 +104,10 @@ int rknn_prepare(struct _RknnProcess* rknn_process)
     memset(rknn_process->outputs, 0, sizeof(rknn_output) * rknn_process->io_num.n_output);
     for (uint32_t i = 0; i < rknn_process->io_num.n_output; i++) {
         rknn_process->outputs[i].index = (int)i;
-        rknn_process->outputs[i].want_float = 0; // 默认不需要
+        rknn_process->outputs[i].want_float = 1;
     }
+
+    rknn_process->outputs_acquired = 0;
 
     return 0;
 }

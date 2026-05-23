@@ -211,8 +211,6 @@ gst_plugin_rknn_finalize(GObject* object)
             dmabuf_munmap(filter->cached_dmabuf_ptr[i], filter->cached_dmabuf_size[i]);
         if (filter->cached_dmabuf_fd[i] >= 0)
             close(filter->cached_dmabuf_fd[i]);
-        if (filter->cached_allocator[i])
-            gst_object_unref(filter->cached_allocator[i]);
         if (filter->cached_dmabuf_mem[i])
             gst_memory_unref(filter->cached_dmabuf_mem[i]);
     }
@@ -330,7 +328,6 @@ gst_plugin_rknn_init(GstPluginRknn* filter)
         filter->cached_dmabuf_fd[i] = -1;
         filter->cached_dmabuf_ptr[i] = NULL;
         filter->cached_dmabuf_size[i] = 0;
-        filter->cached_allocator[i] = NULL;
         filter->cached_dmabuf_mem[i] = NULL;
     }
 
@@ -564,7 +561,7 @@ gst_plugin_rknn_chain(GstPad* pad, GstObject* parent, GstBuffer* buf)
 
     filter = GST_PLUGIN_RKNN(parent);
 
-    g_async_queue_push(filter->queue, gst_buffer_ref(buf));
+    g_async_queue_push(filter->queue, buf);
 
     // Drop the oldest buffer if the queue is too long
     if (g_async_queue_length(filter->queue) > MAX_QUEUE_LENGTH) {
@@ -603,29 +600,25 @@ static void calculate_fps(GstPluginRknn* filter)
         filter->fps_frame_count = 0;
     }
 }
-gboolean prepare_dmabuf_memory(GstPluginRknn* filter, int index, gsize mem_size, GstMemory** mem)
+gboolean prepare_dmabuf_memory(GstPluginRknn* filter, int index, gsize mem_size)
 {
     if (index < 0 || index >= MAX_DMABUF_INSTANCES)
         return FALSE;
 
-    // 如果已分配且大小一致，直接使用（不管是否可写，因为我们轮换使用多个缓冲区）
     if (filter->cached_dmabuf_fd[index] >= 0 && filter->cached_dmabuf_size[index] == mem_size && 
-        filter->cached_dmabuf_mem[index] && filter->cached_dmabuf_ptr[index]) {
-        *mem = filter->cached_dmabuf_mem[index];
+        filter->cached_dmabuf_ptr[index]) {
         return TRUE;
     }
 
-    // 释放旧的
     if (filter->cached_dmabuf_ptr[index])
         dmabuf_munmap(filter->cached_dmabuf_ptr[index], filter->cached_dmabuf_size[index]);
     if (filter->cached_dmabuf_fd[index] >= 0)
         close(filter->cached_dmabuf_fd[index]);
-    if (filter->cached_allocator[index])
-        gst_object_unref(filter->cached_allocator[index]);
-    if (filter->cached_dmabuf_mem[index])
+    if (filter->cached_dmabuf_mem[index]) {
         gst_memory_unref(filter->cached_dmabuf_mem[index]);
+        filter->cached_dmabuf_mem[index] = NULL;
+    }
 
-    // 分配新的
     filter->cached_dmabuf_fd[index] = dmabuf_heap_alloc(filter->dma_heap_fd, NULL, mem_size);
     if (filter->cached_dmabuf_fd[index] < 0) {
         GST_ERROR_OBJECT(filter, "Failed to allocate DMABUF fd from heap fd %d, size %zu",
@@ -637,31 +630,55 @@ gboolean prepare_dmabuf_memory(GstPluginRknn* filter, int index, gsize mem_size,
     if (!filter->cached_dmabuf_ptr[index]) {
         close(filter->cached_dmabuf_fd[index]);
         filter->cached_dmabuf_fd[index] = -1;
-        GST_ERROR_OBJECT(filter, "Failed to mmap DMABUF fd %d, size %zu", filter->cached_dmabuf_fd[index], mem_size);
-        return FALSE;
-    }
-    filter->cached_allocator[index] = gst_dmabuf_allocator_new();
-    if (!filter->cached_allocator[index]) {
-        dmabuf_munmap(filter->cached_dmabuf_ptr[index], mem_size);
-        close(filter->cached_dmabuf_fd[index]);
-        filter->cached_dmabuf_fd[index] = -1;
-        GST_ERROR_OBJECT(filter, "Failed to create DMABUF allocator");
-        return FALSE;
-    }
-    filter->cached_dmabuf_mem[index] = gst_dmabuf_allocator_alloc(filter->cached_allocator[index], filter->cached_dmabuf_fd[index], mem_size);
-    if (!filter->cached_dmabuf_mem[index]) {
-        gst_object_unref(filter->cached_allocator[index]);
-        filter->cached_allocator[index] = NULL;
-        dmabuf_munmap(filter->cached_dmabuf_ptr[index], mem_size);
-        close(filter->cached_dmabuf_fd[index]);
-        filter->cached_dmabuf_fd[index] = -1;
-        GST_ERROR_OBJECT(filter, "Failed to allocate DMABUF memory from fd %d, size %zu",
-            filter->cached_dmabuf_fd[index], mem_size);
+        GST_ERROR_OBJECT(filter, "Failed to mmap DMABUF fd, size %zu", mem_size);
         return FALSE;
     }
     filter->cached_dmabuf_size[index] = mem_size;
-    *mem = filter->cached_dmabuf_mem[index];
+
+    int dup_fd = dup(filter->cached_dmabuf_fd[index]);
+    if (dup_fd < 0) {
+        GST_ERROR_OBJECT(filter, "Failed to dup DMABUF fd %d for index %d", filter->cached_dmabuf_fd[index], index);
+        dmabuf_munmap(filter->cached_dmabuf_ptr[index], filter->cached_dmabuf_size[index]);
+        close(filter->cached_dmabuf_fd[index]);
+        filter->cached_dmabuf_fd[index] = -1;
+        filter->cached_dmabuf_ptr[index] = NULL;
+        return FALSE;
+    }
+
+    GstAllocator* allocator = gst_dmabuf_allocator_new();
+    if (!allocator) {
+        close(dup_fd);
+        dmabuf_munmap(filter->cached_dmabuf_ptr[index], filter->cached_dmabuf_size[index]);
+        close(filter->cached_dmabuf_fd[index]);
+        filter->cached_dmabuf_fd[index] = -1;
+        filter->cached_dmabuf_ptr[index] = NULL;
+        GST_ERROR_OBJECT(filter, "Failed to create DMABUF allocator");
+        return FALSE;
+    }
+
+    filter->cached_dmabuf_mem[index] = gst_dmabuf_allocator_alloc(allocator, dup_fd, mem_size);
+    gst_object_unref(allocator);
+
+    if (!filter->cached_dmabuf_mem[index]) {
+        close(dup_fd);
+        dmabuf_munmap(filter->cached_dmabuf_ptr[index], filter->cached_dmabuf_size[index]);
+        close(filter->cached_dmabuf_fd[index]);
+        filter->cached_dmabuf_fd[index] = -1;
+        filter->cached_dmabuf_ptr[index] = NULL;
+        GST_ERROR_OBJECT(filter, "Failed to allocate DMABUF GstMemory from dup fd %d, size %zu",
+            dup_fd, mem_size);
+        return FALSE;
+    }
+
     return TRUE;
+}
+
+static GstMemory* get_dmabuf_gstmemory(GstPluginRknn* filter, int index)
+{
+    if (index < 0 || index >= MAX_DMABUF_INSTANCES || !filter->cached_dmabuf_mem[index])
+        return NULL;
+
+    return gst_memory_ref(filter->cached_dmabuf_mem[index]);
 }
 static gpointer rknn_task_func(gpointer data)
 {
@@ -680,6 +697,10 @@ static gpointer rknn_task_func(gpointer data)
 
         GstBuffer* buf = g_async_queue_pop(filter->queue);
         gint64 current_time = g_get_monotonic_time();
+        gboolean own_mem_in_dmabuf = FALSE;
+        GstMemory* mem_in_dmabuf = NULL;
+        GstMemory* mem_rknn_in = NULL;
+        GstMemory* mem_in_rgb = NULL;
 
         if (task_data->stop) {
             GST_INFO_OBJECT(filter, "Stopping rknn task thread");
@@ -692,8 +713,6 @@ static gpointer rknn_task_func(gpointer data)
             continue;
         }
 
-
-
         if (filter->bypass) {
             if (!task_data->stop) {
                 GST_LOG_OBJECT(filter, "Bypassing the filter, pushing buffer out");
@@ -704,116 +723,102 @@ static gpointer rknn_task_func(gpointer data)
             continue;
         }
 
-        // start of processing
-
-        // 处理跳帧推理逻辑
         filter->need_inference = FALSE;
         if (filter->frame_skip == 0 || filter->frame_counter % (filter->frame_skip + 1) == 0) {
             filter->need_inference = TRUE;
         }
 
-        // 更新帧计数器
         filter->frame_counter++;
-        if (filter->frame_counter > 1000000) { // 避免溢出
+        if (filter->frame_counter > 1000000) {
             filter->frame_counter = 0;
         }
 
-        // Normalize to DMABUF memory
         GstMemory* mem_in = gst_buffer_peek_memory(buf, 0);
-        GstMemory* mem_in_dmabuf = NULL;
         gsize mem_size = 0;
         if (!mem_in) {
             GST_ERROR_OBJECT(filter, "Failed to get memory from buffer");
-            gst_buffer_unref(buf);
-            continue;
+            goto cleanup;
         }
         if (gst_is_dmabuf_memory(mem_in)) {
             GST_DEBUG_OBJECT(filter, "Processing DMABUF memory");
-            // no conversion needed
             mem_in_dmabuf = mem_in;
             mem_size = gst_memory_get_sizes(mem_in, NULL, NULL);
         } else {
             GST_DEBUG_OBJECT(filter, "Processing non-DMABUF memory");
-            // will convert to DMABUF memory
             mem_size = gst_memory_get_sizes(mem_in, NULL, NULL);
-            if (!prepare_dmabuf_memory(filter, 0, mem_size, &mem_in_dmabuf)) {
+            if (!prepare_dmabuf_memory(filter, 0, mem_size)) {
                 GST_ERROR_OBJECT(filter, "Failed to prepare DMABUF memory");
-                gst_buffer_unref(buf);
-                continue;
+                goto cleanup;
             }
+            mem_in_dmabuf = get_dmabuf_gstmemory(filter, 0);
             if (!mem_in_dmabuf) {
-                GST_ERROR_OBJECT(filter, "Failed to get DMABUF memory");
-                gst_buffer_unref(buf);
-                continue;
+                GST_ERROR_OBJECT(filter, "Failed to get DMABUF GstMemory");
+                goto cleanup;
             }
+            own_mem_in_dmabuf = TRUE;
             GstMapInfo map_info;
             if (!gst_memory_map(mem_in, &map_info, GST_MAP_READ)) {
                 GST_ERROR_OBJECT(filter, "Failed to map input memory");
-                gst_buffer_unref(buf);
-                continue;
+                goto cleanup;
             }
-            // Copy data to DMABUF memory
-            dmabuf_sync_start(gst_dmabuf_memory_get_fd(mem_in_dmabuf));
+            dmabuf_sync_start(filter->cached_dmabuf_fd[0]);
             memcpy(filter->cached_dmabuf_ptr[0], map_info.data, mem_size);
-            dmabuf_sync_stop(gst_dmabuf_memory_get_fd(mem_in_dmabuf));
+            dmabuf_sync_stop(filter->cached_dmabuf_fd[0]);
             gst_memory_unmap(mem_in, &map_info);
-            // GST_DEBUG_OBJECT(filter, "Copied %zu bytes to DMABUF memory fd %d",
-            //     mem_size, gst_dmabuf_memory_get_fd(mem_in_dmabuf));
         }
 
         if (filter->rknn_model_loaded == FALSE) {
             GST_ERROR_OBJECT(filter, "RKNN model not loaded, skipping processing");
-            gst_buffer_unref(buf);
-            continue;
+            goto cleanup;
         }
 
-        GstMemory* mem_rknn_in = NULL;
-        if (!prepare_dmabuf_memory(filter, 1, filter->rknn_process.model_width * filter->rknn_process.model_height * filter->rknn_process.model_channel, &mem_rknn_in)) {
+        if (!prepare_dmabuf_memory(filter, 1, filter->rknn_process.model_width * filter->rknn_process.model_height * filter->rknn_process.model_channel)) {
             GST_ERROR_OBJECT(filter, "Failed to prepare RKNN input memory");
-            gst_buffer_unref(buf);
-            continue;
+            goto cleanup;
         }
-
-        GstMemory* mem_in_rgb = NULL;
+        mem_rknn_in = get_dmabuf_gstmemory(filter, 1);
+        if (!mem_rknn_in) {
+            GST_ERROR_OBJECT(filter, "Failed to create RKNN input GstMemory");
+            goto cleanup;
+        }
 
         filter->src_buffer_index = (filter->src_buffer_index + 1) % (MAX_DMABUF_INSTANCES - 2);
 
-        if (!prepare_dmabuf_memory(filter, 2 + filter->src_buffer_index, calc_buffer_size(filter->aligned_width, filter->aligned_height, GST_VIDEO_FORMAT_RGB), &mem_in_rgb)) {
+        int rgb_index = 2 + filter->src_buffer_index;
+        GST_DEBUG_OBJECT(filter, "Frame %d: Preparing RGB DMABUF at index %d", (int)filter->frame_counter, rgb_index);
+        if (!prepare_dmabuf_memory(filter, rgb_index, calc_buffer_size(filter->aligned_width, filter->aligned_height, GST_VIDEO_FORMAT_RGB))) {
             GST_ERROR_OBJECT(filter, "Failed to prepare RGB memory for RGA");
-            gst_buffer_unref(buf);
-            continue;
+            goto cleanup;
         }
 
-        // rga improcess options
         im_opt_t opt;
         memset(&opt, 0, sizeof(opt));
         int usage = IM_SYNC;
         int ret;
 
-        // yuv rgb conversion
-        GST_DEBUG_OBJECT(filter, "gst_dmabuf_memory_get_fd(mem_in_dmabuf) = %d, rknn_input_mem fd = %d",
-            gst_dmabuf_memory_get_fd(mem_in_dmabuf), gst_dmabuf_memory_get_fd(mem_rknn_in));
-        rga_buffer_t rga_buf_in_dmabuf = wrapbuffer_fd_t(gst_dmabuf_memory_get_fd(mem_in_dmabuf), filter->sink_width, filter->sink_height, filter->sink_width, filter->sink_height, filter->sink_rga_format);
+        int fd_in_dmabuf = own_mem_in_dmabuf ? filter->cached_dmabuf_fd[0] : gst_dmabuf_memory_get_fd(mem_in_dmabuf);
+
+        GST_DEBUG_OBJECT(filter, "fd_in_dmabuf = %d, rknn_input_mem fd = %d, rgb fd = %d",
+            fd_in_dmabuf, filter->cached_dmabuf_fd[1], filter->cached_dmabuf_fd[rgb_index]);
+        rga_buffer_t rga_buf_in_dmabuf = wrapbuffer_fd_t(fd_in_dmabuf, filter->sink_width, filter->sink_height, filter->sink_width, filter->sink_height, filter->sink_rga_format);
         im_rect rect_in_dmabuf = { 0, 0, filter->sink_width, filter->sink_height };
-        rga_buffer_t rga_buf_in_rgb = wrapbuffer_fd_t(gst_dmabuf_memory_get_fd(mem_in_rgb), filter->aligned_width, filter->aligned_height, filter->aligned_width, filter->aligned_height, RK_FORMAT_RGB_888);
+        rga_buffer_t rga_buf_in_rgb = wrapbuffer_fd_t(filter->cached_dmabuf_fd[rgb_index], filter->aligned_width, filter->aligned_height, filter->aligned_width, filter->aligned_height, RK_FORMAT_RGB_888);
         im_rect rect_in_rgb = { 0, 0, filter->sink_width, filter->sink_height };
-        rga_buffer_t pat = wrapbuffer_virtualaddr_t(NULL, 0, 0, 0, 0, RK_FORMAT_RGB_888); // pattern unused
-        im_rect rect_pat = { 0, 0, 0, 0 }; // pattern rect unused
-        dmabuf_sync_start(gst_dmabuf_memory_get_fd(mem_in_dmabuf));
-        dmabuf_sync_start(gst_dmabuf_memory_get_fd(mem_in_rgb));
-        ret = improcess(rga_buf_in_dmabuf, rga_buf_in_rgb, // src, dst buffers
-            pat, // pattern buffer unused
+        rga_buffer_t pat = wrapbuffer_virtualaddr_t(NULL, 0, 0, 0, 0, RK_FORMAT_RGB_888);
+        im_rect rect_pat = { 0, 0, 0, 0 };
+        dmabuf_sync_start(fd_in_dmabuf);
+        dmabuf_sync_start(filter->cached_dmabuf_fd[rgb_index]);
+        ret = improcess(rga_buf_in_dmabuf, rga_buf_in_rgb,
+            pat,
             rect_in_dmabuf, rect_in_rgb, rect_pat,
             usage);
-        dmabuf_sync_stop(gst_dmabuf_memory_get_fd(mem_in_dmabuf));
-        dmabuf_sync_stop(gst_dmabuf_memory_get_fd(mem_in_rgb));
+        dmabuf_sync_stop(fd_in_dmabuf);
+        dmabuf_sync_stop(filter->cached_dmabuf_fd[rgb_index]);
         if (ret != IM_STATUS_SUCCESS) {
             GST_ERROR_OBJECT(filter, "RGA RGB conversion failed: %s", imStrError(ret));
-            gst_buffer_unref(buf);
-            continue;
+            goto cleanup;
         }
 
-        // Calculate scaling parameters for coordinate transformation (always calculate)
         float scale_w = (float)filter->rknn_process.model_width / filter->sink_width;
         float scale_h = (float)filter->rknn_process.model_height / filter->sink_height;
         float scale = scale_w < scale_h ? scale_w : scale_h;
@@ -831,85 +836,85 @@ static gpointer rknn_task_func(gpointer data)
         filter->rknn_process.original_height = filter->sink_height;
 
         if (filter->need_inference) {
-            // rga letterboxing
-            rga_buffer_t rga_buf_rknn_input = wrapbuffer_fd_t(gst_dmabuf_memory_get_fd(mem_rknn_in), filter->rknn_process.model_width, filter->rknn_process.model_height, filter->rknn_process.model_width, filter->rknn_process.model_height, RK_FORMAT_RGB_888);
-            // Define letterboxing rectangles
+            rga_buffer_t rga_buf_rknn_input = wrapbuffer_fd_t(filter->cached_dmabuf_fd[1], filter->rknn_process.model_width, filter->rknn_process.model_height, filter->rknn_process.model_width, filter->rknn_process.model_height, RK_FORMAT_RGB_888);
             im_rect rect_rknn_input = { offset_x, offset_y, new_w, new_h };
             GST_DEBUG_OBJECT(filter, "RGA letterboxing: src_rect=(%d,%d,%d,%d), dst_rect=(%d,%d,%d,%d)",
                 rect_in_dmabuf.x, rect_in_dmabuf.y, rect_in_dmabuf.width, rect_in_dmabuf.height,
                 rect_rknn_input.x, rect_rknn_input.y, rect_rknn_input.width, rect_rknn_input.height);
 
-            dmabuf_sync_start(gst_dmabuf_memory_get_fd(mem_in_rgb));
-            dmabuf_sync_start(gst_dmabuf_memory_get_fd(mem_rknn_in));
-            ret = improcess(rga_buf_in_rgb, rga_buf_rknn_input, // src, dst buffers
-                pat, // pattern buffer unused
+            dmabuf_sync_start(filter->cached_dmabuf_fd[rgb_index]);
+            dmabuf_sync_start(filter->cached_dmabuf_fd[1]);
+            ret = improcess(rga_buf_in_rgb, rga_buf_rknn_input,
+                pat,
                 rect_in_rgb, rect_rknn_input, rect_pat,
                 usage);
-            dmabuf_sync_stop(gst_dmabuf_memory_get_fd(mem_in_rgb));
-            dmabuf_sync_stop(gst_dmabuf_memory_get_fd(mem_rknn_in));
+            dmabuf_sync_stop(filter->cached_dmabuf_fd[rgb_index]);
+            dmabuf_sync_stop(filter->cached_dmabuf_fd[1]);
             if (ret != IM_STATUS_SUCCESS) {
                 GST_ERROR_OBJECT(filter, "RGA letterboxing failed: %s", imStrError(ret));
-                gst_buffer_unref(buf);
-                continue;
+                goto cleanup;
             }
         }
-        // Save RGB result as BMP (24-bit) for debugging
-        // save_rgb_to_bmp("out.bmp", (unsigned char*)(filter->cached_dmabuf_ptr[1]), filter->model_width, filter->model_height);
-
-        // gst_buffer_unref(buf);
 
         filter->rknn_process.inputs[0].buf = filter->cached_dmabuf_ptr[1];
-        // Calculate FPS
         calculate_fps(filter);
 
-        dmabuf_sync_start(gst_dmabuf_memory_get_fd(mem_in_rgb));
+        dmabuf_sync_start(filter->cached_dmabuf_fd[rgb_index]);
         if (filter->need_inference) {
-            rknn_inference_and_postprocess(&filter->rknn_process, filter->cached_dmabuf_ptr[2 + filter->src_buffer_index], 0.5, 0.4, filter->show_fps ? 1 : 0, filter->current_fps, 1, current_time);
-        } else {
-            rknn_inference_and_postprocess(&filter->rknn_process, filter->cached_dmabuf_ptr[2 + filter->src_buffer_index], 0.5, 0.4, filter->show_fps ? 1 : 0, filter->current_fps, 0, current_time);
+            dmabuf_sync_start(filter->cached_dmabuf_fd[1]);
         }
-        dmabuf_sync_stop(gst_dmabuf_memory_get_fd(mem_in_rgb));
-        // Create a new buffer for output
+        GST_DEBUG_OBJECT(filter, "Before rknn_inference_and_postprocess, need_inference=%d", filter->need_inference);
+        if (filter->need_inference) {
+            rknn_inference_and_postprocess(&filter->rknn_process, filter->cached_dmabuf_ptr[rgb_index], 0.5, 0.4, filter->show_fps ? 1 : 0, filter->current_fps, 1, current_time);
+        } else {
+            rknn_inference_and_postprocess(&filter->rknn_process, filter->cached_dmabuf_ptr[rgb_index], 0.5, 0.4, filter->show_fps ? 1 : 0, filter->current_fps, 0, current_time);
+        }
+        GST_DEBUG_OBJECT(filter, "After rknn_inference_and_postprocess");
+        dmabuf_sync_stop(filter->cached_dmabuf_fd[rgb_index]);
+        if (filter->need_inference) {
+            dmabuf_sync_stop(filter->cached_dmabuf_fd[1]);
+        }
+
+        mem_in_rgb = get_dmabuf_gstmemory(filter, rgb_index);
+        if (!mem_in_rgb) {
+            GST_ERROR_OBJECT(filter, "Failed to create RGB output GstMemory");
+            goto cleanup;
+        }
+
         GstBuffer* output_buffer = gst_buffer_new();
-        
-        // Add the RGB memory to the output buffer
-        GstMemory* mem_in_rgb_ref = gst_memory_ref(mem_in_rgb);
-        gst_buffer_append_memory(output_buffer, mem_in_rgb_ref);
-        
-        // 继承时间戳和元数据
+        gst_buffer_append_memory(output_buffer, mem_in_rgb);
+        mem_in_rgb = NULL;
+
         GST_BUFFER_PTS(output_buffer) = GST_BUFFER_PTS(buf);
         GST_BUFFER_DTS(output_buffer) = GST_BUFFER_DTS(buf);
         GST_BUFFER_DURATION(output_buffer) = GST_BUFFER_DURATION(buf);
 
-        g_print("[RKNN] last_detect_result.count = %d\n", filter->rknn_process.last_detect_result.count);
+        GST_DEBUG_OBJECT(filter, "last_detect_result.count = %d", filter->rknn_process.last_detect_result.count);
         if (filter->rknn_process.last_detect_result.count > 0) {
-            g_print("[RKNN] Adding face meta with %d faces\n", filter->rknn_process.last_detect_result.count);
+            GST_DEBUG_OBJECT(filter, "Adding face meta with %d faces", filter->rknn_process.last_detect_result.count);
             gst_face_meta_add(output_buffer, 
                              filter->rknn_process.last_detect_result.count,
                              filter->rknn_process.last_detect_result.results);
-            g_print("[RKNN] Face meta added successfully\n");
-            // Verify meta was added
-            GstFaceMeta* check_meta = gst_face_meta_get(output_buffer);
-            if (check_meta) {
-                g_print("[RKNN] Verified: Face meta retrieved with %d faces\n", check_meta->face_count);
-            } else {
-                g_print("[RKNN] ERROR: Face meta not found after adding!\n");
-            }
         }
 
-        // Ensure RGB caps are set before pushing buffer
-        // gst_plugin_rknn_ensure_rgb_caps(filter);
-
         if (!task_data->stop) {
-            gst_pad_push(filter->srcpad, output_buffer);
+            GstFlowReturn ret = gst_pad_push(filter->srcpad, output_buffer);
+            GST_DEBUG_OBJECT(filter, "gst_pad_push returned %d (%s)", ret, gst_flow_get_name(ret));
         } else {
             gst_buffer_unref(output_buffer);
         }
 
-        gst_buffer_unref(buf);
-        // print time consumed
         GST_DEBUG_OBJECT(filter, "Processing time: %ld us",
             g_get_monotonic_time() - current_time);
+
+cleanup:
+        if (mem_in_rgb)
+            gst_memory_unref(mem_in_rgb);
+        if (mem_rknn_in)
+            gst_memory_unref(mem_rknn_in);
+        if (own_mem_in_dmabuf && mem_in_dmabuf)
+            gst_memory_unref(mem_in_dmabuf);
+        gst_buffer_unref(buf);
     }
     return NULL;
 }

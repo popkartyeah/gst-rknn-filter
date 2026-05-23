@@ -70,6 +70,7 @@ struct _RknnProcess {
     char* model_path;
     RknnModelType model_type;
     detect_result_group_t last_detect_result;
+    int outputs_acquired;
 };
 
 #ifdef __cplusplus

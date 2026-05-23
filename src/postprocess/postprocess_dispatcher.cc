@@ -1,5 +1,3 @@
-// Postprocess dispatcher - routes to model-specific postprocess based on model_type
-
 #include "../postprocess.h"
 #include "../rknnprocess.h"
 #include "postprocess_impl.h"
@@ -20,11 +18,20 @@ int postprocess_dispatch(struct _RknnProcess* rknn_process,
     int ret = 0;
 
     if (do_inference) {
-        rknn_outputs_release(rknn_process->ctx, rknn_process->io_num.n_output, rknn_process->outputs);
+        if (rknn_process->outputs_acquired) {
+            rknn_outputs_release(rknn_process->ctx, rknn_process->io_num.n_output, rknn_process->outputs);
+            rknn_process->outputs_acquired = 0;
+        }
         rknn_inputs_set(rknn_process->ctx, rknn_process->io_num.n_input, rknn_process->inputs);
         ret = rknn_run(rknn_process->ctx, NULL);
         ret = rknn_outputs_get(rknn_process->ctx, rknn_process->io_num.n_output, rknn_process->outputs, NULL);
         if (ret != 0) return ret;
+        rknn_process->outputs_acquired = 1;
+    } else {
+        if (rknn_process->outputs_acquired) {
+            rknn_outputs_release(rknn_process->ctx, rknn_process->io_num.n_output, rknn_process->outputs);
+            rknn_process->outputs_acquired = 0;
+        }
     }
 
     std::vector<float> out_scales;

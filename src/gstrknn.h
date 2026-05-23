@@ -112,7 +112,6 @@ struct _GstPluginRknn {
     int cached_dmabuf_fd[MAX_DMABUF_INSTANCES];
     void* cached_dmabuf_ptr[MAX_DMABUF_INSTANCES];
     gsize cached_dmabuf_size[MAX_DMABUF_INSTANCES];
-    GstAllocator* cached_allocator[MAX_DMABUF_INSTANCES];
     GstMemory* cached_dmabuf_mem[MAX_DMABUF_INSTANCES];
 
     GstBuffer* src_buffer;
