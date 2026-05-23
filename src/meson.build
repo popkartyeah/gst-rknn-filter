@@ -16,6 +16,7 @@ plugin_sources = [
   'dmabuffer.c',
   'rknnprocess.cc',
   'postprocess.cc',
+  'gst_face_meta.c',
   'postprocess/postprocess_dispatcher.cc',
   'postprocess/postprocess_yolov8.cc',
   'postprocess/postprocess_yolov6.cc',

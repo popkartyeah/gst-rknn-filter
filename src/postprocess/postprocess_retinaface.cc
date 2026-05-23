@@ -11,6 +11,10 @@
 #include <set>
 #include <vector>
 
+static inline float clampf(float val, float min_val, float max_val) {
+    return val > min_val ? (val < max_val ? val : max_val) : min_val;
+}
+
 static float CalculateOverlap(float xmin0, float ymin0, float xmax0, float ymax0,
     float xmin1, float ymin1, float xmax1, float ymax1);
 static int nms(int validCount, std::vector<float>& outputLocations, std::vector<int> classIds,
